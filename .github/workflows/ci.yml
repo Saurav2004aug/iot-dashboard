@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Protocol unit tests + server integration tests
+        run: python -m unittest discover -s tests -v
+
+      - name: End-to-end smoke test (real server process + CLI client)
+        run: |
+          python ws_server.py > server.log 2>&1 &
+          for i in $(seq 1 20); do curl -fs http://127.0.0.1:9001/health && break; sleep 0.5; done
+          python ws_client.py --count 3
+
+      - name: Server log
+        if: always()
+        run: cat server.log || true

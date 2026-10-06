@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IoT Sensor Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #1a1d23; --border: #2a2e37; --text: #e6e6e6; --muted: #9aa0a6;
+    --ok: #4ade80; --bad: #f87171; --temp: #60a5fa; --hum: #a78bfa; --vib: #fbbf24;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text); margin: 0; padding: 24px;
+  }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px 24px; margin-bottom: 20px; }
+  h1 { font-weight: 600; margin: 0; font-size: 24px; }
+  .status { font-size: 14px; color: var(--muted); }
+  .status::before { content: "●"; margin-right: 6px; }
+  .status.connected { color: var(--ok); }
+  .status.disconnected { color: var(--bad); }
+  .meta { font-size: 13px; color: var(--muted); margin-left: auto; }
+
+  .devices { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; margin-bottom: 20px; }
+  .device {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 16px 20px; cursor: pointer; transition: border-color .2s;
+  }
+  .device.selected { border-color: var(--temp); }
+  .device.warning { border-color: var(--bad); box-shadow: 0 0 0 1px var(--bad) inset; }
+  .device h2 { font-size: 14px; margin: 0 0 10px; color: var(--muted); font-weight: 600; display: flex; justify-content: space-between; }
+  .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #1f3b2a; color: var(--ok); }
+  .warning .badge { background: #3b1f1f; color: var(--bad); }
+  .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .metric .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+  .metric .value { font-size: 20px; font-weight: 700; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .warning .metric.vib .value { color: var(--bad); }
+
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px 20px; margin-bottom: 20px; }
+  .panel-head { display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+  .panel-head h3 { margin: 0; font-size: 15px; font-weight: 600; }
+  .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); }
+  .legend span::before { content: ""; display: inline-block; width: 10px; height: 3px; margin-right: 6px; vertical-align: middle; background: var(--c); }
+  canvas { width: 100%; height: 280px; display: block; }
+
+  .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; font-size: 14px; }
+  input[type=range] { width: 200px; accent-color: var(--vib); }
+  .hint { font-size: 12px; color: var(--muted); }
+  .threshold-value { font-variant-numeric: tabular-nums; min-width: 48px; font-weight: 600; }
+
+  .log { max-height: 160px; overflow-y: auto; font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--muted); margin: 0; padding: 0; list-style: none; }
+  .log li { padding: 3px 0; border-bottom: 1px solid var(--border); }
+  .log li.bad { color: var(--bad); }
+  .log li.ok { color: var(--ok); }
+
+  @media (max-width: 600px) {
+    body { padding: 16px; }
+    .meta { margin-left: 0; width: 100%; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Real-Time IoT Sensor Dashboard</h1>
+  <div class="status disconnected" id="status">Connecting…</div>
+  <div class="meta" id="meta"></div>
+</header>
+
+<section class="devices" id="devices"></section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h3 id="chart-title">Live readings</h3>
+    <div class="legend">
+      <span style="--c: var(--temp)">Temperature (°C)</span>
+      <span style="--c: var(--hum)">Humidity (%)</span>
+      <span style="--c: var(--vib)">Vibration (g)</span>
+    </div>
+  </div>
+  <canvas id="chart"></canvas>
+</section>
+
+<section class="panel">
+  <div class="panel-head"><h3>Alert threshold</h3></div>
+  <div class="controls">
+    <label for="threshold">Vibration warning above</label>
+    <input type="range" id="threshold" min="0.1" max="3" step="0.1" value="1.2">
+    <span class="threshold-value" id="threshold-value">1.2 g</span>
+    <span class="hint">Changing this sends a command to the server. Every connected dashboard updates.</span>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head"><h3>Event log</h3></div>
+  <ul class="log" id="log"></ul>
+</section>
+
+<script>
+const WS_URL = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host || "127.0.0.1:9001"}/ws`;
+const MAX_POINTS = 120;
+
+const $ = (id) => document.getElementById(id);
+const statusEl = $("status"), metaEl = $("meta"), devicesEl = $("devices"), logEl = $("log");
+const slider = $("threshold"), sliderValue = $("threshold-value");
+const canvas = $("chart"), ctx = canvas.getContext("2d");
+
+let ws, threshold = 1.2, selected = null, reconnectDelay = 500;
+let messageCount = 0, connectedAt = null;
+const history = {};      // device_id -> [{t, temperature_c, humidity_pct, vibration_g}]
+const lastStatus = {};   // device_id -> "normal" | "warning"
+
+// ---------- connection ----------
+
+function connect() {
+  ws = new WebSocket(WS_URL);
+
+  ws.onopen = () => {
+    statusEl.textContent = "Connected";
+    statusEl.className = "status connected";
+    reconnectDelay = 500;
+    connectedAt = Date.now();
+    log("Connected to " + WS_URL, "ok");
+  };
+
+  ws.onclose = () => {
+    statusEl.textContent = `Disconnected. Retrying in ${(reconnectDelay / 1000).toFixed(1)}s…`;
+    statusEl.className = "status disconnected";
+    setTimeout(connect, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 10000);  // exponential backoff
+  };
+
+  ws.onerror = () => ws.close();
+
+  ws.onmessage = (event) => {
+    messageCount++;
+    const msg = JSON.parse(event.data);
+    switch (msg.type) {
+      case "hello":
+        msg.devices.forEach(ensureDevice);
+        if (!selected) select(msg.devices[0]);
+        setThreshold(msg.vibration_threshold);
+        break;
+      case "history":
+        Object.keys(history).forEach((k) => (history[k] = []));
+        msg.ticks.forEach(ingest);
+        render();
+        break;
+      case "tick":
+        ingest(msg);
+        render();
+        break;
+      case "config":
+        setThreshold(msg.vibration_threshold);
+        log(`Threshold set to ${msg.vibration_threshold.toFixed(1)} g`);
+        break;
+      case "error":
+        log("Server error: " + msg.error, "bad");
+        break;
+    }
+  };
+}
+
+function send(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+// ---------- state ----------
+
+function ensureDevice(id) {
+  if (history[id]) return;
+  history[id] = [];
+  const el = document.createElement("div");
+  el.className = "device";
+  el.id = "dev-" + id;
+  el.innerHTML = `
+    <h2>${id}<span class="badge">normal</span></h2>
+    <div class="metrics">
+      <div class="metric"><div class="label">Temp</div><div class="value" data-k="temperature_c">--</div></div>
+      <div class="metric"><div class="label">Humidity</div><div class="value" data-k="humidity_pct">--</div></div>
+      <div class="metric vib"><div class="label">Vibration</div><div class="value" data-k="vibration_g">--</div></div>
+    </div>`;
+  el.onclick = () => select(id);
+  devicesEl.appendChild(el);
+}
+
+function ingest(tick) {
+  for (const r of tick.readings) {
+    ensureDevice(r.device_id);
+    const series = history[r.device_id];
+    series.push({ t: tick.timestamp, ...r });
+    if (series.length > MAX_POINTS) series.shift();
+
+    if (lastStatus[r.device_id] && lastStatus[r.device_id] !== r.status) {
+      // Stamp with the reading's own time (history replays happened in the past).
+      const at = new Date(tick.timestamp * 1000);
+      if (r.status === "warning") log(`${r.device_id}: vibration ${r.vibration_g.toFixed(3)} g exceeds ${threshold.toFixed(1)} g`, "bad", at);
+      else log(`${r.device_id}: back to normal`, "ok", at);
+    }
+    lastStatus[r.device_id] = r.status;
+  }
+}
+
+function select(id) {
+  selected = id;
+  document.querySelectorAll(".device").forEach((el) => el.classList.toggle("selected", el.id === "dev-" + id));
+  $("chart-title").textContent = `Live readings: ${id}`;
+  drawChart();
+}
+
+function setThreshold(value) {
+  threshold = value;
+  slider.value = value;
+  sliderValue.textContent = value.toFixed(1) + " g";
+  drawChart();
+}
+
+let sendTimer;
+slider.addEventListener("input", () => {
+  sliderValue.textContent = Number(slider.value).toFixed(1) + " g";
+  clearTimeout(sendTimer);  // debounce: send once the user stops dragging
+  sendTimer = setTimeout(() => send({ type: "set_threshold", value: Number(slider.value) }), 250);
+});
+
+// ---------- rendering ----------
+
+function render() {
+  for (const [id, series] of Object.entries(history)) {
+    const last = series[series.length - 1];
+    if (!last) continue;
+    const el = $("dev-" + id);
+    el.querySelector('[data-k="temperature_c"]').textContent = last.temperature_c.toFixed(1) + "°C";
+    el.querySelector('[data-k="humidity_pct"]').textContent = last.humidity_pct.toFixed(0) + "%";
+    el.querySelector('[data-k="vibration_g"]').textContent = last.vibration_g.toFixed(2) + " g";
+    el.classList.toggle("warning", last.status === "warning");
+    el.querySelector(".badge").textContent = last.status;
+  }
+  const uptime = connectedAt ? Math.round((Date.now() - connectedAt) / 1000) : 0;
+  metaEl.textContent = `${messageCount} messages · connected ${uptime}s`;
+  drawChart();
+}
+
+function drawChart() {
+  // Match the canvas backing store to its CSS size × devicePixelRatio (sharp on HiDPI).
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const series = history[selected] || [];
+  const pad = { l: 8, r: 8, t: 10, b: 10 };
+  const plotH = h - pad.t - pad.b;
+
+  // grid
+  ctx.strokeStyle = "#2a2e37";
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.t + (plotH * i) / 4;
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(w - pad.r, y); ctx.stroke();
+  }
+
+  const scale = (v, min, max) => pad.t + plotH - ((v - min) / (max - min)) * plotH;
+
+  // vibration threshold line (vibration axis is 0–3 g)
+  const ty = scale(threshold, 0, 3);
+  ctx.setLineDash([6, 4]);
+  ctx.strokeStyle = "#f87171";
+  ctx.beginPath(); ctx.moveTo(pad.l, ty); ctx.lineTo(w - pad.r, ty); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = "#f87171";
+  ctx.font = "11px sans-serif";
+  ctx.fillText(`alert ${threshold.toFixed(1)} g`, w - pad.r - 70, ty - 4);
+
+  if (series.length < 2) return;
+  const step = (w - pad.l - pad.r) / (MAX_POINTS - 1);
+  const offset = MAX_POINTS - series.length;  // newest point always at the right edge
+
+  const line = (key, min, max, color) => {
+    ctx.beginPath();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    series.forEach((p, i) => {
+      const x = pad.l + (i + offset) * step;
+      const y = scale(Math.min(max, Math.max(min, p[key])), min, max);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  };
+  line("temperature_c", 10, 40, "#60a5fa");
+  line("humidity_pct", 0, 100, "#a78bfa");
+  line("vibration_g", 0, 3, "#fbbf24");
+}
+
+function log(text, cls = "", at = new Date()) {
+  const li = document.createElement("li");
+  li.className = cls;
+  li.textContent = `${at.toLocaleTimeString()}  ${text}`;
+  logEl.prepend(li);
+  while (logEl.children.length > 100) logEl.lastChild.remove();
+}
+
+window.addEventListener("resize", drawChart);
+connect();
+</script>
+
+</body>
+</html>

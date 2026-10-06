@@ -1,0 +1,3 @@
+# No external dependencies. The WebSocket server, HTTP handling, and client
+# are all built on Python's standard library (socket, hashlib, base64,
+# threading, queue) by design, to demonstrate the protocol from scratch.
